@@ -1,0 +1,52 @@
+-- Ultimate Anti-Fling Backlash & Fling All (Kháng lực ngược + Càn quét toàn server)
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local function getRoot(char)
+    return char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+end
+
+local function startGodFling()
+    local character = LocalPlayer.Character
+    if not character then return end
+    local root = getRoot(character)
+    if not root then return end
+
+    -- Tắt va chạm và đặt thể chất về 0 để không bị đẩy ngược lại
+    for _, v in pairs(character:GetDescendants()) do
+        if v:IsA("BasePart") then
+            v.CustomPhysicalProperties = PhysicalProperties.new(0, 0, 0, 0, 0)
+            v.CanCollide = false
+        end
+    end
+
+    -- Khóa trọng lực của bản thân để không bị văng đi khi va chạm mạnh
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Velocity = Vector3.new(0, 0, 0)
+    bv.Parent = root
+
+    local bav = Instance.new("BodyAngularVelocity")
+    bav.AngularVelocity = Vector3.new(0, 99999, 0)
+    bav.MaxTorque = Vector3.new(99999, 99999, 99999)
+    bav.Parent = root
+
+    -- Vòng lặp càn quét không sợ phản đòn
+    RunService.Stepped:Connect(function()
+        if not LocalPlayer.Character or not getRoot(LocalPlayer.Character) then return end
+        
+        for _, player in pairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character then
+                local targetRoot = getRoot(player.Character)
+                if targetRoot and root then
+                    -- Ép vị trí dính chặt và truyền vận tốc vô cực sang nạn nhân
+                    root.CFrame = targetRoot.CFrame
+                    root.Velocity = Vector3.new(50000, 50000, 50000)
+                end
+            end
+        end
+    end)
+end
+
+startGodFling()
