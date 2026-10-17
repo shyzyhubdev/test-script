@@ -1,0 +1,874 @@
+--// ULTRA FPS BOOST v3
+--// Dark Texture + Remove Effects + Keep Animation
+--// Anti Screen Shake + FPS Counter + Low Quality + Time-sliced Loading
+--//
+--// CHỈ CHỈNH CÁCH HIỂN THỊ TRÊN MÁY BẠN (client-side).
+--// Không dùng Remote, không gửi gì lên server, không thay đổi game hay người chơi khác.
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local genv = (getgenv and getgenv()) or _G
+
+-- chạy lại script: dừng bản cũ trước để không bị nhân đôi kết nối (nhân đôi = lag thêm)
+if type(genv.__UltraFPSBoostStop) == "function" then
+    pcall(genv.__UltraFPSBoostStop)
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local SoundService = game:GetService("SoundService")
+local Stats = game:GetService("Stats")
+
+local okMat, MaterialService = pcall(game.GetService, game, "MaterialService")
+if not okMat then
+    MaterialService = nil
+end
+
+local Player = Players.LocalPlayer
+while not Player do
+    task.wait()
+    Player = Players.LocalPlayer
+end
+
+--------------------------------------------------
+-- SETTINGS
+--------------------------------------------------
+
+local DARK_AMOUNT = 0.65
+
+local REMOVE_TEXTURE = true         -- xoá Decal/Texture/SurfaceAppearance/MaterialVariant/quần áo + TextureID của mesh/union
+local REMOVE_EFFECTS = true         -- xoá Particle/Trail/Beam/Smoke/Fire/Sparkles/Highlight/ForceField
+local REMOVE_EXPLOSIONS = true      -- ẩn vụ nổ
+local REMOVE_LIGHTS = true          -- xoá Point/Spot/Surface light
+local REMOVE_POST_EFFECTS = true    -- tắt Bloom/Blur/SunRays/ColorCorrection/DepthOfField, Atmosphere, Clouds
+local DISABLE_SHADOWS = true
+local LOW_WATER_TERRAIN = true      -- nước phẳng, tắt cỏ Terrain
+local LOWEST_QUALITY = true         -- QualityLevel thấp nhất
+local KEEP_QUALITY_LOCKED = true    -- engine/game tự nâng đồ hoạ lại thì ép xuống thấp nhất tiếp
+local MUTE_SOUNDS = false           -- tắt tiếng (đổi thành true nếu muốn)
+local REMOVE_SOUND_FX = true        -- tắt reverb/echo/EQ... (âm thanh vẫn nghe bình thường)
+local SIMPLIFY_OTHER_PLAYERS = true -- xoá phụ kiện + quần áo của người chơi KHÁC (chỉ trên màn hình bạn)
+local HIDE_BILLBOARDS = false       -- tắt BillboardGui trong workspace (tên, thanh máu, số damage...) - bật nếu vẫn lag
+local UNLOCK_FPS = true             -- mở khoá giới hạn FPS (cần executor hỗ trợ setfpscap)
+local FPS_CAP = 999
+local ANTI_SCREEN_SHAKE = true
+local SHOW_FPS = true
+local SHOW_MEMORY = true            -- hiện thêm RAM Roblox đang dùng cạnh số FPS
+
+local HIDE_FX_PARTS = true          -- tự ẩn part/mesh hiệu ứng mới spawn (skill, shockwave...)
+local FX_KEEP_SECONDS = 4           -- part còn tồn tại quá số giây này sẽ được coi là đồ thật và hiện lại
+local FX_MAX_HIDDEN = 800           -- tối đa bao nhiêu part bị ẩn cùng lúc (tránh nhầm map vừa spawn là hiệu ứng)
+local TOGGLE_KEY = Enum.KeyCode.RightControl -- phím bật/tắt ẩn hiệu ứng (điện thoại: chạm vào dòng FPS)
+
+local LOAD_BUDGET_MS = 6            -- ms/frame dành cho dọn dẹp khi đang load map hoặc có nhiều object mới
+local LIVE_BUDGET_MS = 2.5          -- ms/frame khi đang chơi bình thường
+
+--------------------------------------------------
+-- STATE / HELPERS
+--------------------------------------------------
+
+local SMOOTH = Enum.Material.SmoothPlastic
+local PERFORMANCE = Enum.RenderFidelity.Performance
+local LOAD_BUDGET = LOAD_BUDGET_MS / 1000
+local LIVE_BUDGET = LIVE_BUDGET_MS / 1000
+
+local sethidden = sethiddenproperty or set_hidden_property
+
+local okStream, streamingValue = pcall(function()
+    return workspace.StreamingEnabled
+end)
+local STREAMING = okStream and streamingValue == true
+
+local running = true
+local connections = {}
+local gui = nil
+
+local function track(conn)
+    connections[#connections + 1] = conn
+    return conn
+end
+
+--------------------------------------------------
+-- HÀNG ĐỢI XỬ LÝ (CHIA NHỎ THEO THỜI GIAN, KHÔNG GIẬT KHI LOAD/STREAM MAP)
+--------------------------------------------------
+
+local newQueue, nqHead, nqTail = {}, 1, 0        -- object mới spawn (ưu tiên)
+local pendingLists, plHead = {}, 1                -- danh sách object có sẵn lúc chạy script
+local curList, curTotal, curIdx = nil, 0, 1
+
+local function enqueueNew(obj)
+    nqTail += 1
+    newQueue[nqTail] = obj
+end
+
+local function nextList()
+    local list = pendingLists[plHead]
+    if list then
+        pendingLists[plHead] = nil
+        plHead += 1
+        curList, curTotal, curIdx = list, #list, 1
+        return true
+    end
+    return false
+end
+
+--------------------------------------------------
+-- PHÂN LOẠI OBJECT (IsA chỉ gọi 1 lần cho mỗi ClassName, sau đó tra bảng cache)
+--------------------------------------------------
+
+local function classify(obj)
+    -- GIỮ ANIMATION
+    if obj:IsA("Animator")
+        or obj:IsA("Animation")
+        or obj:IsA("AnimationController") then
+        return false
+    end
+
+    -- BLOCK / PART / MESH / UNION
+    if obj:IsA("BasePart") then
+        if obj:IsA("Terrain") then
+            return false
+        end
+        if obj:IsA("MeshPart") then
+            return "MeshPart"
+        end
+        if obj:IsA("PartOperation") then
+            return "Union"
+        end
+        return "Part"
+    end
+
+    -- TEXTURE
+    if REMOVE_TEXTURE then
+        if obj:IsA("Decal")
+            or obj:IsA("SurfaceAppearance")
+            or obj:IsA("MaterialVariant")
+            or obj:IsA("Clothing")
+            or obj:IsA("ShirtGraphic") then
+            return "Destroy"
+        end
+
+        if obj:IsA("SpecialMesh") then
+            return "SpecialMesh"
+        end
+    end
+
+    -- EFFECT (Destroy thay vì Enabled=false: game gọi :Emit() hoặc bật lại Enabled vẫn không có tác dụng)
+    if REMOVE_EFFECTS then
+        if obj:IsA("ParticleEmitter")
+            or obj:IsA("Trail")
+            or obj:IsA("Beam")
+            or obj:IsA("Smoke")
+            or obj:IsA("Fire")
+            or obj:IsA("Sparkles")
+            or obj:IsA("Highlight")
+            or obj:IsA("ForceField") then
+            return "Destroy"
+        end
+    end
+
+    -- EXPLOSION
+    if REMOVE_EXPLOSIONS and obj:IsA("Explosion") then
+        return "Explosion"
+    end
+
+    -- LIGHT
+    if REMOVE_LIGHTS and obj:IsA("Light") then
+        return "Destroy"
+    end
+
+    -- POST EFFECT / ATMOSPHERE / CLOUDS
+    if REMOVE_POST_EFFECTS then
+        if obj:IsA("PostEffect") then
+            return "PostEffect"
+        end
+        if obj:IsA("Atmosphere") then
+            return "Atmosphere"
+        end
+        if obj:IsA("Clouds") then
+            return "Clouds"
+        end
+    end
+
+    -- SOUND
+    if MUTE_SOUNDS and obj:IsA("Sound") then
+        return "Mute"
+    end
+
+    if REMOVE_SOUND_FX and obj:IsA("SoundEffect") then
+        return "SoundFx"
+    end
+
+    -- PHỤ KIỆN NGƯỜI CHƠI KHÁC
+    if SIMPLIFY_OTHER_PLAYERS and obj:IsA("Accoutrement") then
+        return "Accessory"
+    end
+
+    -- BILLBOARD
+    if HIDE_BILLBOARDS and obj:IsA("BillboardGui") then
+        return "Billboard"
+    end
+
+    return false
+end
+
+local kindCache = {}
+
+local function kindOf(obj)
+    local className = obj.ClassName
+    local kind = kindCache[className]
+
+    if kind == nil then
+        kind = classify(obj)
+        kindCache[className] = kind
+    end
+
+    return kind
+end
+
+local PART_KINDS = { Part = true, MeshPart = true, Union = true }
+
+--------------------------------------------------
+-- XỬ LÝ TỪNG LOẠI
+--------------------------------------------------
+
+local darkened = setmetatable({}, { __mode = "k" })      -- part đã tối rồi: không tối thêm khi bị gắn lại vào workspace
+local postHooked = setmetatable({}, { __mode = "k" })
+
+local function darkColor(color)
+    return Color3.new(
+        color.R * DARK_AMOUNT,
+        color.G * DARK_AMOUNT,
+        color.B * DARK_AMOUNT
+    )
+end
+
+local function hPart(p)
+    if not darkened[p] then
+        darkened[p] = true
+        p.Color = darkColor(p.Color)
+    end
+
+    p.Material = SMOOTH
+    p.Reflectance = 0
+
+    if DISABLE_SHADOWS then
+        p.CastShadow = false
+    end
+
+    if REMOVE_TEXTURE then
+        p.MaterialVariant = ""
+    end
+end
+
+local function meshExtras(p)
+    p.RenderFidelity = PERFORMANCE
+
+    if REMOVE_TEXTURE then
+        p.TextureID = ""
+    end
+end
+
+local function hMesh(p)
+    pcall(hPart, p)
+    pcall(meshExtras, p)
+end
+
+local function unionExtras(p)
+    p.UsePartColor = true
+    p.RenderFidelity = PERFORMANCE
+
+    if REMOVE_TEXTURE then
+        p.TextureID = ""
+    end
+end
+
+local function hUnion(p)
+    pcall(hPart, p)
+    pcall(unionExtras, p)
+end
+
+local function hDestroy(o)
+    o:Destroy()
+end
+
+local function hSpecialMesh(o)
+    o.TextureId = ""
+end
+
+local function hExplosion(o)
+    o.Visible = false
+    o.BlastPressure = 0
+end
+
+local function hPost(o)
+    o.Enabled = false
+
+    -- game bật lại thì tắt lại (mỗi effect chỉ gắn 1 lần)
+    if not postHooked[o] then
+        postHooked[o] = true
+        o:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if running and o.Enabled then
+                o.Enabled = false
+            end
+        end)
+    end
+end
+
+local function hAtmosphere(o)
+    o.Density = 0
+    o.Haze = 0
+    o.Glare = 0
+end
+
+local function hClouds(o)
+    o.Enabled = false
+end
+
+local function hMute(o)
+    o.Volume = 0
+end
+
+local function hSoundFx(o)
+    o.Enabled = false
+end
+
+local function hAccessory(o)
+    local model = o.Parent
+    if not model or not model:IsA("Model") then
+        return
+    end
+
+    -- nhân vật của người chơi khác (hoặc clone/tàn ảnh mang tên họ); của mình thì giữ nguyên
+    local plr = Players:GetPlayerFromCharacter(model) or Players:FindFirstChild(model.Name)
+
+    if plr and plr:IsA("Player") and plr ~= Player then
+        o:Destroy()
+    end
+end
+
+local function hBillboard(o)
+    o.Enabled = false
+end
+
+local HANDLERS = {
+    Part = hPart,
+    MeshPart = hMesh,
+    Union = hUnion,
+    Destroy = hDestroy,
+    SpecialMesh = hSpecialMesh,
+    Explosion = hExplosion,
+    PostEffect = hPost,
+    Atmosphere = hAtmosphere,
+    Clouds = hClouds,
+    Mute = hMute,
+    SoundFx = hSoundFx,
+    Accessory = hAccessory,
+    Billboard = hBillboard,
+}
+
+--------------------------------------------------
+-- ẨN PART/MESH HIỆU ỨNG MỚI SPAWN (CHỈ ẨN PHÍA MÌNH, KHÔNG ẢNH HƯỞNG GAMEPLAY)
+--------------------------------------------------
+
+local fxEnabled = HIDE_FX_PARTS
+local fxQueue = {}                                  -- { {part, hạn} }
+local fxHidden = setmetatable({}, { __mode = "k" })
+
+-- Tên các bộ phận cơ thể thật (R6 + R15) — part khác gắn trên nhân vật được coi là hiệu ứng
+local BODY_PARTS = {
+    ["Head"] = true, ["Torso"] = true,
+    ["Left Arm"] = true, ["Right Arm"] = true,
+    ["Left Leg"] = true, ["Right Leg"] = true,
+    ["HumanoidRootPart"] = true,
+    ["UpperTorso"] = true, ["LowerTorso"] = true,
+    ["LeftUpperArm"] = true, ["LeftLowerArm"] = true, ["LeftHand"] = true,
+    ["RightUpperArm"] = true, ["RightLowerArm"] = true, ["RightHand"] = true,
+    ["LeftUpperLeg"] = true, ["LeftLowerLeg"] = true, ["LeftFoot"] = true,
+    ["RightUpperLeg"] = true, ["RightLowerLeg"] = true, ["RightFoot"] = true,
+}
+
+-- Tìm nhân vật THẬT của người chơi chứa part này (clone tàn ảnh không tính vì không thuộc Player nào)
+local function ownerCharacter(part)
+    local model = part:FindFirstAncestorOfClass("Model")
+
+    while model do
+        if Players:GetPlayerFromCharacter(model) then
+            return model
+        end
+        model = model:FindFirstAncestorOfClass("Model")
+    end
+
+    return nil
+end
+
+-- true = part này là hiệu ứng/tàn ảnh -> ẩn
+local function shouldHide(part)
+    local char = ownerCharacter(part)
+
+    -- không thuộc nhân vật người chơi nào: hiệu ứng, tàn ảnh (clone), part tạm...
+    if not char then
+        return true
+    end
+
+    -- phụ kiện, vũ khí của nhân vật thật: giữ
+    if part:FindFirstAncestorWhichIsA("Accoutrement") or part:FindFirstAncestorOfClass("Tool") then
+        return false
+    end
+
+    -- bộ phận cơ thể thật: giữ
+    if part.Parent == char and BODY_PARTS[part.Name] then
+        return false
+    end
+
+    -- part lạ gắn trên người (nước, aura dạng mesh...): ẩn
+    return true
+end
+
+local function setHidden(part)
+    part.LocalTransparencyModifier = 1
+end
+
+local function setShown(part)
+    part.LocalTransparencyModifier = 0
+end
+
+local function showFx(part)
+    if fxHidden[part] then
+        fxHidden[part] = nil
+        pcall(setShown, part)
+    end
+end
+
+local function hideFx(obj)
+    if not fxEnabled then
+        return
+    end
+
+    -- đang ẩn quá nhiều part cùng lúc = nhiều khả năng là map vừa spawn, không phải hiệu ứng
+    if #fxQueue >= FX_MAX_HIDDEN then
+        return
+    end
+
+    -- game bật StreamingEnabled: map liên tục spawn part -> bỏ qua part tĩnh (anchored + CanCollide)
+    -- để map không bị "tàng hình" 4 giây mỗi lần stream
+    if STREAMING and obj.Anchored and obj.CanCollide then
+        return
+    end
+
+    if not shouldHide(obj) then
+        return
+    end
+
+    pcall(setHidden, obj)
+
+    fxHidden[obj] = true
+    fxQueue[#fxQueue + 1] = { obj, os.clock() + FX_KEEP_SECONDS }
+end
+
+local function setFxEnabled(state)
+    fxEnabled = state
+
+    if not fxEnabled then
+        for _, item in ipairs(fxQueue) do
+            showFx(item[1])
+        end
+        table.clear(fxQueue)
+    end
+end
+
+-- Dọn hàng đợi: part biến mất -> bỏ; sống quá lâu hoặc hoá ra là nhân vật -> hiện lại
+task.spawn(function()
+    while running do
+        task.wait(0.25)
+
+        local now = os.clock()
+        local i = 1
+
+        while i <= #fxQueue do
+            local item = fxQueue[i]
+            local part = item[1]
+
+            local remove = false
+
+            if not part.Parent then
+                remove = true
+            elseif now >= item[2] or not shouldHide(part) then
+                showFx(part)
+                remove = true
+            end
+
+            if remove then
+                fxQueue[i] = fxQueue[#fxQueue]
+                fxQueue[#fxQueue] = nil
+            else
+                i += 1
+            end
+        end
+    end
+end)
+
+-- Phím bật/tắt
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or input.KeyCode ~= TOGGLE_KEY then
+        return
+    end
+
+    setFxEnabled(not fxEnabled)
+end))
+
+--------------------------------------------------
+-- XỬ LÝ 1 OBJECT + BƠM HÀNG ĐỢI THEO NGÂN SÁCH THỜI GIAN
+--------------------------------------------------
+
+local function process(obj, isNew)
+    local kind = kindOf(obj)
+    if not kind then
+        return
+    end
+
+    -- đã bị xoá trước khi tới lượt
+    if not obj.Parent then
+        return
+    end
+
+    local handler = HANDLERS[kind]
+    if handler then
+        pcall(handler, obj)
+    end
+
+    if isNew and PART_KINDS[kind] then
+        pcall(hideFx, obj)
+    end
+end
+
+local function pump(budget)
+    local t0 = os.clock()
+    local n = 0
+
+    -- 1) object mới spawn trước (skill, hiệu ứng, map stream...)
+    while nqHead <= nqTail do
+        local obj = newQueue[nqHead]
+        newQueue[nqHead] = nil
+        nqHead += 1
+
+        process(obj, true)
+
+        n += 1
+        if n % 8 == 0 and os.clock() - t0 >= budget then
+            return
+        end
+    end
+
+    nqHead, nqTail = 1, 0
+
+    -- 2) dọn lần đầu những gì đã có sẵn trong map
+    while curList or nextList() do
+        while curIdx <= curTotal do
+            local obj = curList[curIdx]
+            curIdx += 1
+
+            process(obj, false)
+
+            n += 1
+            if n % 16 == 0 and os.clock() - t0 >= budget then
+                return
+            end
+        end
+
+        curList = nil
+    end
+end
+
+track(RunService.RenderStepped:Connect(function()
+    local loading = curList or pendingLists[plHead]
+
+    if loading or nqHead <= nqTail then
+        local heavy = loading or (nqTail - nqHead) > 1500
+        pump(heavy and LOAD_BUDGET or LIVE_BUDGET)
+    end
+end))
+
+--------------------------------------------------
+-- OBJECT SPAWN SAU NÀY + OBJECT CÓ SẴN
+--------------------------------------------------
+
+-- Lighting/Sound/Material nhỏ nên dọn trước, workspace dọn sau cùng
+local roots = { Lighting, SoundService }
+if MaterialService then
+    roots[#roots + 1] = MaterialService
+end
+roots[#roots + 1] = workspace
+
+for _, root in ipairs(roots) do
+    track(root.DescendantAdded:Connect(function(obj)
+        -- chỉ đưa vào hàng đợi loại object cần xử lý (bỏ qua Weld, Attachment, Script...)
+        if kindOf(obj) then
+            enqueueNew(obj)
+        end
+    end))
+end
+
+task.spawn(function()
+    for _, root in ipairs(roots) do
+        local ok, list = pcall(root.GetDescendants, root)
+
+        if ok and list then
+            pendingLists[#pendingLists + 1] = list
+        end
+
+        task.wait()
+    end
+end)
+
+--------------------------------------------------
+-- LIGHTING / SOUND
+--------------------------------------------------
+
+pcall(function()
+    if DISABLE_SHADOWS then
+        Lighting.GlobalShadows = false
+        Lighting.ShadowSoftness = 0
+    end
+
+    Lighting.Brightness = 1
+    Lighting.FogEnd = 100000
+    Lighting.EnvironmentDiffuseScale = 0
+    Lighting.EnvironmentSpecularScale = 0
+end)
+
+-- Compatibility = nhẹ nhất (cần executor hỗ trợ sethiddenproperty)
+if sethidden then
+    pcall(sethidden, Lighting, "Technology", Enum.Technology.Compatibility)
+end
+
+if REMOVE_SOUND_FX then
+    pcall(function()
+        SoundService.AmbientReverb = Enum.ReverbType.NoReverb
+    end)
+end
+
+--------------------------------------------------
+-- TERRAIN / WATER
+--------------------------------------------------
+
+if LOW_WATER_TERRAIN then
+    pcall(function()
+        local terrain = workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            terrain.WaterWaveSize = 0
+            terrain.WaterWaveSpeed = 0
+            terrain.WaterReflectance = 0
+            if sethidden then
+                sethidden(terrain, "Decoration", false)
+            end
+        end
+    end)
+end
+
+--------------------------------------------------
+-- QUALITY / FPS CAP
+--------------------------------------------------
+
+local function lockQuality()
+    pcall(function()
+        local rendering = settings().Rendering
+        if rendering.QualityLevel ~= Enum.QualityLevel.Level01 then
+            rendering.QualityLevel = Enum.QualityLevel.Level01
+        end
+    end)
+end
+
+if LOWEST_QUALITY then
+    lockQuality()
+
+    if KEEP_QUALITY_LOCKED then
+        task.spawn(function()
+            while running do
+                task.wait(3)
+                lockQuality()
+            end
+        end)
+    end
+end
+
+if UNLOCK_FPS and setfpscap then
+    pcall(setfpscap, FPS_CAP)
+end
+
+--------------------------------------------------
+-- ANTI SCREEN SHAKE
+--------------------------------------------------
+
+local function antiShakeStep()
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    -- bỏ rung do CameraOffset
+    local char = Player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.CameraOffset ~= Vector3.zero then
+        hum.CameraOffset = Vector3.zero
+    end
+
+    -- giữ vị trí + hướng nhìn, bỏ roll/nghiêng
+    local cf = camera.CFrame
+    local pos = cf.Position
+    local look = cf.LookVector
+
+    if math.abs(look.Y) < 0.999 then
+        camera.CFrame = CFrame.lookAt(pos, pos + look, Vector3.yAxis)
+    end
+end
+
+if ANTI_SCREEN_SHAKE then
+    pcall(function()
+        RunService:UnbindFromRenderStep("AntiScreenShake")
+    end)
+
+    RunService:BindToRenderStep(
+        "AntiScreenShake",
+        Enum.RenderPriority.Camera.Value + 1,
+        function()
+            pcall(antiShakeStep)
+        end
+    )
+end
+
+--------------------------------------------------
+-- DỪNG SCRIPT (tự gọi khi chạy lại script)
+--------------------------------------------------
+
+local function stop()
+    running = false
+
+    for _, conn in ipairs(connections) do
+        pcall(conn.Disconnect, conn)
+    end
+    table.clear(connections)
+
+    pcall(function()
+        RunService:UnbindFromRenderStep("AntiScreenShake")
+    end)
+
+    for _, item in ipairs(fxQueue) do
+        showFx(item[1])
+    end
+    table.clear(fxQueue)
+
+    if gui then
+        pcall(gui.Destroy, gui)
+        gui = nil
+    end
+end
+
+genv.__UltraFPSBoostStop = stop
+
+--------------------------------------------------
+-- FPS COUNTER (chạm vào để bật/tắt HIDE FX)
+--------------------------------------------------
+
+local ramFailed = false
+
+local function getRam()
+    if ramFailed then
+        return nil
+    end
+
+    local ok, mb = pcall(function()
+        return Stats:GetTotalMemoryUsageMb()
+    end)
+
+    if ok and type(mb) == "number" then
+        return math.floor(mb)
+    end
+
+    ramFailed = true
+    return nil
+end
+
+if SHOW_FPS then
+
+    task.spawn(function()
+        local playerGui = Player:WaitForChild("PlayerGui")
+
+        local old = playerGui:FindFirstChild("UltraFPSCounter")
+        if old then
+            old:Destroy()
+        end
+
+        if not running then
+            return
+        end
+
+        gui = Instance.new("ScreenGui")
+        gui.Name = "UltraFPSCounter"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 999
+        gui.Parent = playerGui
+
+        local label = Instance.new("TextButton")
+        label.Size = UDim2.new(0, 330, 0, 28)
+        label.Position = UDim2.new(0, 8, 0, 8)
+        label.BackgroundTransparency = 1
+        label.AutoButtonColor = false
+        label.TextColor3 = Color3.new(1, 1, 1)
+        label.TextStrokeTransparency = 0.5
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 15
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = "FPS: --"
+        label.Parent = gui
+
+        track(label.Activated:Connect(function()
+            setFxEnabled(not fxEnabled)
+        end))
+
+        local frames = 0
+        local elapsed = 0
+
+        track(RunService.RenderStepped:Connect(function(dt)
+
+            frames += 1
+            elapsed += dt
+
+            if elapsed >= 0.5 then
+
+                local fps = math.floor(frames / elapsed + 0.5)
+                local text = "FPS: " .. fps .. "  |  HIDE FX: " .. (fxEnabled and "ON" or "OFF")
+
+                if SHOW_MEMORY then
+                    local ram = getRam()
+                    if ram then
+                        text = text .. "  |  RAM: " .. ram .. "MB"
+                    end
+                end
+
+                label.Text = text
+
+                -- xanh = mượt, vàng = tạm, đỏ = lag
+                if fps >= 50 then
+                    label.TextColor3 = Color3.fromRGB(80, 255, 120)
+                elseif fps >= 30 then
+                    label.TextColor3 = Color3.fromRGB(255, 220, 80)
+                else
+                    label.TextColor3 = Color3.fromRGB(255, 80, 80)
+                end
+
+                frames = 0
+                elapsed = 0
+            end
+
+        end))
+    end)
+
+end
+
+print("ULTRA FPS BOOST v3 LOADED")
