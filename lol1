@@ -1,0 +1,48 @@
+
+--// DREAMY ANIME COLOR GRADING
+--// LocalScript trong game Roblox ông có quyền chỉnh sửa
+
+local Lighting = game:GetService("Lighting")
+
+Lighting.Brightness = 1.8
+Lighting.ExposureCompensation = -0.1
+Lighting.Ambient = Color3.fromRGB(100, 110, 135)
+Lighting.OutdoorAmbient = Color3.fromRGB(145, 160, 165)
+
+local function getEffect(className, name)
+    local effect = Lighting:FindFirstChild(name)
+    if not effect then
+        effect = Instance.new(className)
+        effect.Name = name
+        effect.Parent = Lighting
+    end
+    return effect
+end
+
+local color = getEffect("ColorCorrectionEffect", "DreamyColor")
+color.Enabled = true
+color.Brightness = 0
+color.Contrast = 0.12
+color.Saturation = 0.18
+color.TintColor = Color3.fromRGB(255, 235, 215)
+
+local bloom = getEffect("BloomEffect", "DreamyBloom")
+bloom.Enabled = true
+bloom.Intensity = 0.12
+bloom.Size = 16
+bloom.Threshold = 1.4
+
+local rays = getEffect("SunRaysEffect", "DreamySunRays")
+rays.Enabled = true
+rays.Intensity = 0.035
+rays.Spread = 0.8
+
+local atmosphere = getEffect("Atmosphere", "DreamyAir")
+atmosphere.Density = 0.18
+atmosphere.Offset = 0.1
+atmosphere.Color = Color3.fromRGB(190, 215, 245)
+atmosphere.Decay = Color3.fromRGB(255, 215, 180)
+atmosphere.Glare = 0.05
+atmosphere.Haze = 0.8
+
+print("Dreamy Anime Color Grading enabled!")
